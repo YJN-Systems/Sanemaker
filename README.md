@@ -1,0 +1,392 @@
+# Sanemaker
+
+Sanemaker is a QEMU TCG plugin for validating Selfpatch-SLR (SPSLR).
+
+It records accesses to target-type objects explicitly marked by the guest through a lightweight trap API. Recorded memory accesses are normalized against object metadata and code metadata, allowing executions before and after randomization to be compared independent of the actual randomized layout.
+
+The repository contains:
+
+- the QEMU plugin
+- a static trap library for guest programs
+- analysis utilities for metadata generation and log processing
+
+This README is intended as a reference manual for Sanemaker. It documents the trap API, plugin options, and accompanying utilities, but intentionally focuses on the interface rather than a step-by-step tutorial.
+
+Further documentation is available on the [**Selfpatch-SLR documentation website**](https://spslr.yjn-systems.com/sanemaker.html). For a more informal walkthrough of a real-world debugging session using Sanemaker, see the blog post [**Sanemaking the Linux Kernel Boot Process**](https://spslr.yjn-systems.com/blog/sanemk_kboot.html).
+
+---
+
+# Building
+
+Sanemaker targets the QEMU plugin API from QEMU 11.0.2.
+
+```bash
+cmake -S . -B build \
+    -DQEMU_PLUGIN_HDR=/path/to/qemu/include/plugins/qemu-plugin.h
+
+cmake --build build -j$(nproc)
+```
+
+This produces:
+
+```
+build/sanemaker/sanemaker.so
+```
+
+the QEMU plugin, and
+
+```
+build/libtraps/libsanetraps.a
+```
+
+the trap library to be linked into instrumented binaries.
+
+---
+
+# Integrating the Trap API
+
+Applications interact with Sanemaker through `traps.h`.
+
+When compiled normally, all trap macros compile to no-ops (or simply return the provided default value). Instrumented code therefore requires no runtime changes outside Sanemaker builds.
+
+To enable traps, compile with
+
+```bash
+-DSANEMAKER
+```
+
+and include
+
+```c
+#include <sanemaker/traps.h>
+```
+
+Then link against
+
+```
+libsanetraps.a
+```
+
+---
+
+# Trap Reference
+
+## Tagging Objects
+
+```c
+sanemaker_target_tag(ptr, target_type);
+```
+
+Starts monitoring memory accesses to the object beginning at `ptr`.
+
+The second argument must be the object's SPSLR target type. The `sanemaker_target_tag()` macro obtains the target's 16-byte hash by calling `spslr_target_hash(target_type)` and passes that hash to the Sanemaker trap. The SPSLR runtime API header must be included for the target hash macro definitions.
+
+Example:
+
+```c
+foo *obj = malloc(sizeof(*obj));
+
+sanemaker_target_tag(obj, foo);
+```
+
+---
+
+## Removing Objects
+
+```c
+sanemaker_target_untag(ptr);
+```
+
+Stops monitoring the object.
+
+Objects should normally be untagged before they are destroyed.
+
+Example:
+
+```c
+sanemaker_target_untag(obj);
+free(obj);
+```
+
+---
+
+## Publishing a New Layout
+
+```c
+sanemaker_finish_layout(fields, target_hash);
+```
+
+Called by Selfpatch after SPSLR has finalized the layout of a target type.
+
+The plugin updates its internal offset table so that future accesses are reported using the randomized layout.
+
+---
+
+## Runtime Queries
+
+```c
+int res = sanemaker_fetch(what, default);
+```
+
+If Sanemaker is not enabled, the default value is returned. Otherwise, Sanemaker may choose the return value.
+
+Currently supported queries are:
+
+```
+SANEMAKER_FETCH_SPSLR_ENABLED
+```
+
+which reflects the plugin's `spslr=` command-line option. Sanemaker sets it to either 0 or 1, acting as a boolean.
+
+---
+
+## Signalling State Changes
+
+```c
+sanemaker_signal(signal);
+```
+
+Supported signals:
+
+```
+SANEMAKER_SIGNAL_PATCH_BOUNDARY
+```
+
+Marks the transition between pre-randomization and post-randomization execution. It is called by Selfpatch when the main image has been fully patched.
+
+Subsequent accesses are recorded in the "after" log.
+
+```
+SANEMAKER_SIGNAL_PAUSE
+SANEMAKER_SIGNAL_RESUME
+```
+
+Temporarily disable and re-enable memory logging of the current thread. These do not affect trap handling. They are currently unavailable in system-mode. In linux-user mode, Selfpatch uses them to suppress memory logging during data pin patching.
+
+---
+
+# Dynamic Images
+
+Applications that generate or dynamically load executable code may register those code ranges.
+
+Register an image:
+
+```c
+sanemaker_new_image(name, base);
+```
+
+Register executable text:
+
+```c
+sanemaker_new_image_text(image_name, begin, end);
+```
+
+Remove mappings:
+
+```c
+sanemaker_drop_image_text(image_name, begin, end);
+sanemaker_drop_image(name);
+```
+
+Registering images allows Sanemaker to normalize instruction addresses from shared libraries or dynamically loaded modules.
+
+---
+
+# Metadata Extraction
+
+Before executing under Sanemaker, metadata describing the binary must be extracted from it.
+
+```bash
+python3 utils/binscan.py \
+    -o metadata.json \
+    ./program
+```
+
+The resulting JSON is supplied to the plugin through the `focus=` option.
+
+---
+
+# Running
+
+Example:
+
+```bash
+qemu-x86_64 \
+    -plugin "./build/sanemaker/sanemaker.so,focus=metadata.json,out=logs,spslr=on" \
+    ./program
+```
+
+---
+
+# Plugin Options
+
+## focus=\<file\>
+
+Metadata generated by `binscan.py`. This argument is required.
+
+---
+
+## out=\<directory\>
+
+Directory in which log files are written. Each host process writes its own, unique log file. This argument is required.
+
+---
+
+## spslr=on|off
+
+Controls the value returned by
+
+```c
+sanemaker_fetch(
+    SANEMAKER_FETCH_SPSLR_ENABLED,
+    default);
+```
+
+It is used to execute identical binaries with SPSLR disabled and enabled. This argument defaults to `false`.
+
+---
+
+## entry=\<address\>
+
+Begin instrumentation once translation reaches the specified guest address. It can be used to ignore initialization code.
+
+---
+
+## kill-at=\<address\>
+
+Terminate execution after reaching the specified guest address and flush all logs. It is primarily intended for reducing log sizes and debugging guests that never terminate.
+
+---
+
+# Log Files
+
+Each process produces one JSON file.
+
+When dumping logs, the plugin first creates
+
+```
+sanemaker.<unique>.json.tmp
+```
+
+which is atomically renamed to
+
+```
+sanemaker.<unique>.json
+```
+
+Successful runs should never leave `.tmp` files behind.
+
+---
+
+# Utility Programs
+
+## `binscan.py`
+
+Scans a binary and produces the metadata JSON consumed by the plugin.
+
+Typical usage:
+
+```bash
+python3 utils/binscan.py \
+    -o binscan.json \
+    ./program
+```
+
+---
+
+## `logmerge.py`
+
+Merges multiple per-process logs into a single JSON log.
+
+Example:
+
+```bash
+python3 utils/logmerge.py \
+    out=merged.json \
+    logs/sanemaker.*.json
+```
+
+This is required for applications creating multiple processes.
+
+---
+
+## `logdiff.py`
+
+Compares two merged logs.
+
+Example:
+
+```bash
+python3 utils/logdiff.py \
+    binscan=binscan.json \
+    missing=missing.logdiff \
+    mismatches=mismatch.logdiff \
+    baseline.json \
+    randomized.json
+```
+
+The tool reports
+
+- instructions missing from one execution
+- field-access mismatches
+- differing observed behaviour
+
+---
+
+# Typical Validation Workflow
+
+Generate metadata:
+
+```bash
+python3 utils/binscan.py \
+    -o binscan.json \
+    ./program
+```
+
+Run without SPSLR:
+
+```bash
+qemu-x86_64 \
+    -plugin "./build/sanemaker/sanemaker.so,focus=binscan.json,out=baseline,spslr=off" \
+    ./program
+```
+
+Merge logs:
+
+```bash
+python3 utils/logmerge.py \
+    out=baseline.json \
+    baseline/sanemaker.*.json
+```
+
+Run with SPSLR enabled:
+
+```bash
+qemu-x86_64 \
+    -plugin "./build/sanemaker/sanemaker.so,focus=binscan.json,out=randomized,spslr=on" \
+    ./program
+```
+
+Merge again:
+
+```bash
+python3 utils/logmerge.py \
+    out=randomized.json \
+    randomized/sanemaker.*.json
+```
+
+Compare:
+
+```bash
+python3 utils/logdiff.py \
+    binscan=binscan.json \
+    missing=missing.logdiff \
+    mismatches=mismatch.logdiff \
+    baseline.json \
+    randomized.json
+```
+
+Correct SPSLR instrumentation should produce equivalent field accesses before and after randomization.
+
+---
+
