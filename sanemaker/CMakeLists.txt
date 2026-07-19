@@ -14,7 +14,7 @@ target_compile_definitions(sanemaker PRIVATE
 
 target_compile_options(sanemaker PRIVATE
 	${GLIB_CFLAGS_OTHER}
-	-Wall -Wextra -Wpedantic
+	-Wall -Wextra -Wpedantic -O2
 )
 
 target_link_libraries(sanemaker PRIVATE
